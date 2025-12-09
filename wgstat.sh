@@ -78,46 +78,37 @@ load_peer_map() {
     return 0
   fi
 
-  # find может возвращать 1 при проблемах чтения отдельных файлов, поэтому
-  # игнорируем ненулевой статус, чтобы не падать из-за set -e.
-  local total=0
-  while IFS= read -r -d '' file; do
-    local pubkey name=""
-    case "${file}" in
-      *.pub)
-        pubkey=$(sanitize_pubkey "$(<"${file}")")
-        name=$(basename "${file}" .pub)
-        ;;
-      *.conf|*.cfg)
-        pubkey=$(sanitize_pubkey "$(grep -E '^\s*PublicKey\s*=\s*' "${file}" | head -n1 | cut -d'=' -f2- || true)")
-        if [[ -z "${pubkey}" ]]; then
-          local privkey
-          privkey=$(sanitize_pubkey "$(grep -E '^\s*PrivateKey\s*=\s*' "${file}" | head -n1 | cut -d'=' -f2- || true)")
-          pubkey=$(derive_pubkey "${privkey}") || pubkey=""
-        fi
-        name=$(grep -iE '^\s*#\s*(name|client)\s*:?' "${file}" | head -n1 | sed -E 's/^\s*#\s*(name|client)\s*:?[[:space:]]*//I' | xargs || true)
-        [[ -z "${name}" ]] && name=$(basename "${file}" .conf)
-        name=${name:-$(basename "${file}")}
-        ;;
-      *.key|*.priv|*.private)
-        local priv_content
-        priv_content=$(sanitize_pubkey "$(<"${file}")")
-        pubkey=$(derive_pubkey "${priv_content}") || pubkey=""
-        name=$(basename "${file}" | sed -E 's/\.(key|priv|private)$//')
-        ;;
-      *)
-        continue
-        ;;
-    esac
+    # find может возвращать 1 при проблемах чтения отдельных файлов, поэтому
+    # игнорируем ненулевой статус, чтобы не падать из-за set -e.
+    local total=0
+    while IFS= read -r -d '' file; do
+      local pubkey name=""
+      case "${file}" in
+        *.pub)
+          pubkey=$(sanitize_pubkey "$(<"${file}")")
+          name=$(basename "${file}" .pub)
+          ;;
+        *.conf|*.cfg)
+          pubkey=$(sanitize_pubkey "$(grep -E '^\s*PublicKey\s*=\s*' "${file}" | head -n1 | cut -d'=' -f2- || true)")
+          name=$(grep -iE '^\s*#\s*(name|client)\s*:?' "${file}" | head -n1 | sed -E 's/^\s*#\s*(name|client)\s*:?[[:space:]]*//I' | xargs || true)
+          [[ -z "${name}" ]] && name=$(basename "${file}" .conf)
+          name=${name:-$(basename "${file}")}
+          ;;
+        *)
+          continue
+          ;;
+      esac
 
-    if [[ -n "${pubkey}" ]]; then
-      PEER_NAME_BY_PUB["${pubkey}"]="${name}"
-      ((total++))
-      debug "Загружен пир '${name}' (${pubkey:0:12}...) из ${file}"
-    fi
-  done < <(find "${PEER_DIR}" -type f -print0 2>/dev/null || true) || true
-  debug "Всего найдено имён пиров: ${total}"
-}
+      if [[ -n "${pubkey}" ]]; then
+        PEER_NAME_BY_PUB["${pubkey}"]="${name}"
+        ((total++))
+        debug "Загружен пир '${name}' (${pubkey:0:12}...) из ${file}"
+      else
+        debug "Пропущен файл без публичного ключа: ${file}"
+      fi
+    done < <(find "${PEER_DIR}" -type f -print0 2>/dev/null || true) || true
+    debug "Всего найдено имён пиров: ${total}"
+  }
 
 show_stats() {
   require_root
