@@ -23,7 +23,9 @@ WGSTAT_CMD = os.getenv("WGSTAT_CMD", "/usr/local/sbin/wgstat.sh")
 
 
 def build_stats_command(peer_name: Optional[str]) -> list[str]:
-    cmd = [WGSTAT_CMD, "stats"]
+    #cmd = [WGSTAT_CMD, "stats"]
+    cmd = shlex.split(WGSTAT_CMD)
+    cmd.append("stats")
     if peer_name:
         cmd.append(peer_name)
     return cmd
