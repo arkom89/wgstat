@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEBUG=${WGSTAT_DEBUG:-0}
+
+debug() {
+  if [[ "${DEBUG}" != "0" ]]; then
+    echo "[debug] $*" >&2
+  fi
+}
+
 # Скрипт для просмотра статистики WireGuard и управления пользователями пиров.
 # Требует права root.
 
-WG_IF="wg0"
-WG_DIR="/etc/wireguard"
-PEER_DIR="${WG_DIR}/peer"
+WG_IF="${WG_IF:-wg0}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+PEER_DIR="${WG_DIR}/peers"
 WG_ADD_PEER_SCRIPT=${WG_ADD_PEER_SCRIPT:-}
 
 usage() {
@@ -40,36 +48,74 @@ human_bytes() {
   _out="${bytes} ${units[$idx]}"
 }
 
+sanitize_pubkey() {
+  local raw=$1
+  # удаляем комментарии в конце строки и любые пробелы/переводы строк
+  raw=${raw%%#*}
+  raw=$(echo -n "${raw}" | tr -d '[:space:]')
+  printf '%s' "${raw}"
+}
+
+derive_pubkey() {
+  local priv=$1
+  if [[ -z "${priv}" ]]; then
+    return 1
+  fi
+  if ! command -v wg &>/dev/null; then
+    return 1
+  fi
+  local derived
+  if ! derived=$(printf '%s' "${priv}" | wg pubkey 2>/dev/null); then
+    return 1
+  fi
+  sanitize_pubkey "${derived}"
+}
+
 load_peer_map() {
   declare -gA PEER_NAME_BY_PUB=()
-  [[ -d "${PEER_DIR}" ]] || return
+  if [[ ! -d "${PEER_DIR}" ]]; then
+    debug "Каталог с пирами ${PEER_DIR} не найден"
+    return 0
+  fi
 
-  while IFS= read -r -d '' file; do
-    local pubkey name=""
-    case "${file}" in
-      *.pub)
-        pubkey=$(<"${file}")
-        name=$(basename "${file}" .pub)
-        ;;
-      *.conf|*.cfg)
-        pubkey=$(grep -E '^\s*PublicKey\s*=\s*' "${file}" | head -n1 | cut -d'=' -f2- | xargs)
-        name=$(grep -iE '^\s*#\s*(name|client)\s*:?' "${file}" | head -n1 | sed -E 's/^\s*#\s*(name|client)\s*:?[[:space:]]*//I')
-        [[ -z "${name}" ]] && name=$(basename "${file}" .conf)
-        name=${name:-$(basename "${file}")}
-        ;;
-      *)
-        continue
-        ;;
-    esac
+    # find может возвращать 1 при проблемах чтения отдельных файлов, поэтому
+    # игнорируем ненулевой статус, чтобы не падать из-за set -e.
+    local total=0
+    while IFS= read -r -d '' file; do
+      local pubkey name=""
+      case "${file}" in
+        *.pub)
+          pubkey=$(sanitize_pubkey "$(<"${file}")")
+          name=$(basename "${file}" .pub)
+          ;;
+        *.conf|*.cfg)
+          pubkey=$(sanitize_pubkey "$(grep -E '^\s*PublicKey\s*=\s*' "${file}" | head -n1 | cut -d'=' -f2- || true)")
+          name=$(grep -iE '^\s*#\s*(name|client)\s*:?' "${file}" | head -n1 | sed -E 's/^\s*#\s*(name|client)\s*:?[[:space:]]*//I' | xargs || true)
+          [[ -z "${name}" ]] && name=$(basename "${file}" .conf)
+          name=${name:-$(basename "${file}")}
+          ;;
+        *)
+          continue
+          ;;
+      esac
 
-    if [[ -n "${pubkey}" ]]; then
-      PEER_NAME_BY_PUB["${pubkey}"]="${name}"
-    fi
-  done < <(find "${PEER_DIR}" -type f -print0)
-}
+      if [[ -n "${pubkey}" ]]; then
+        PEER_NAME_BY_PUB["${pubkey}"]="${name}"
+        ((total++))
+        debug "Загружен пир '${name}' (${pubkey:0:12}...) из ${file}"
+      else
+        debug "Пропущен файл без публичного ключа: ${file}"
+      fi
+    done < <(find "${PEER_DIR}" -type f -print0 2>/dev/null || true) || true
+    debug "Всего найдено имён пиров: ${total}"
+  }
 
 show_stats() {
   require_root
+  if ! command -v wg >/dev/null 2>&1; then
+    echo "wg не найден. Установи wireguard-tools." >&2
+    exit 1
+  fi
   local filter_name=${1-}
   load_peer_map
 
@@ -79,20 +125,37 @@ show_stats() {
   fi
 
   local dump_output
-  dump_output=$(wg show "${WG_IF}" dump)
-  if [[ -z "${dump_output}" ]]; then
-    echo "Нет данных wg show" >&2
+  if ! dump_output=$(wg show "${WG_IF}" dump 2>/dev/null); then
+    echo "Не удалось получить статистику wg show ${WG_IF} dump" >&2
     exit 1
   fi
+  debug "Строк из wg show: $(echo "${dump_output}" | grep -c . || true)"
 
   printf "%-20s %-18s %-12s %-12s %-20s\n" "Peer" "Allowed IPs" "Received" "Sent" "Last handshake"
   printf '%s\n' "$(printf '%.0s-' {1..82})"
 
-  while IFS=$'\t' read -r pub preshared endpoint allowed last_handshake rx tx keepalive; do
+  local had_peer=false
+  while IFS=$'\t' read -r -a cols; do
     # пропускаем строку интерфейса
-    if [[ "${pub}" == "${WG_IF}" ]]; then
+    if [[ ${#cols[@]} -ge 1 && "${cols[0]}" == "${WG_IF}" ]]; then
       continue
     fi
+
+    # строка может быть битой — пропускаем, если не хватает числовых полей
+    if (( ${#cols[@]} < 7 )); then
+      continue
+    fi
+
+    local pub
+    pub=$(sanitize_pubkey "${cols[0]}")
+    local allowed="${cols[3]:-}" 
+    local last_handshake="${cols[4]:-0}"
+    local rx="${cols[5]:-0}"
+    local tx="${cols[6]:-0}"
+
+    [[ "${last_handshake}" =~ ^[0-9]+$ ]] || last_handshake=0
+    [[ "${rx}" =~ ^[0-9]+$ ]] || rx=0
+    [[ "${tx}" =~ ^[0-9]+$ ]] || tx=0
 
     local name=${PEER_NAME_BY_PUB["${pub}"]-"unknown"}
     if [[ -n "${filter_name}" && "${filter_name}" != "${name}" ]]; then
@@ -110,8 +173,13 @@ show_stats() {
       last_human=$(date -d "@${last_handshake}" '+%Y-%m-%d %H:%M:%S')
     fi
 
+    had_peer=true
     printf "%-20s %-18s %-12s %-12s %-20s\n" "${name}" "${allowed}" "${rx_human}" "${tx_human}" "${last_human}"
-  done <<< "${dump_output}"
+  done <<< "${dump_output}" || true
+
+  if ! $had_peer; then
+    echo "Пиры для ${WG_IF} не найдены" >&2
+  fi
 }
 
 add_peer() {
